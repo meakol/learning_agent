@@ -1,0 +1,9 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+python-pptx>=1.0
+pymupdf>=1.24
+httpx>=0.27
+rank_bm25>=0.2.2
+jieba>=0.42.1
+numpy>=1.26            # rank_bm25 0.2.2 的 requires_dist 包含 numpy

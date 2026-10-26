@@ -1,0 +1,4 @@
+# 可选的向量检索依赖；只有 RETRIEVAL_MODE=local_vector 时需要。
+# numpy 已包含在 requirements.txt（rank_bm25 的运行依赖）。
+sentence-transformers>=2.7
+# 或 FlagEmbedding；二者择一，不默认安装。

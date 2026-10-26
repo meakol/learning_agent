@@ -1,0 +1,5 @@
+{
+  "zh": "使用简体中文输出（专业术语可在括号中保留英文）。重要度标签统一使用 [核心] / [重点] / [了解]。使用短句和分行排版，避免长段落与长句；并列要点优先用结构组件或分组 bullet。",
+  "en": "Write the notes entirely in English. Use compact note-style English: short parallel bullets or fragments, not prose. Each bullet must be at most 18 words; split multi-clause sentences into separate bullets. Never copy full sentences from the slides. Use importance tags [Core] / [Key] / [Info]. Use :::branches for parallel points, :::pyramid for levels, :::mindmap for a central concept, and :::table for parameters. Leave blank lines between sections.",
+  "bilingual": "双语输出：每个知识点先写中文，再另起一行写英文，英文行必须以 'EN:' 开头并缩进；章节标题使用 '中文 / English' 形式。重要度标签统一使用 [核心] / [重点] / [了解]。中文用短句；英文行控制在 18 words 以内，不要逐字直译，也不要照抄课件原句。并列关系用 :::branches，层级关系用 :::pyramid，中心概念用 :::mindmap。"
+}
