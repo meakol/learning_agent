@@ -4,7 +4,6 @@ import math
 import re
 from typing import Any
 from .prompts import load, load_json
-from .text_utils import is_admin_heading, is_admin_text, strip_admin_lines
 
 LEVELS: list[dict[str, Any]] = [
     {"level": 1, "zh": "速览", "en": "Sprint", "desc": "只保留最核心的考点，考前 3 分钟扫一遍。"},
@@ -39,8 +38,8 @@ def build_context(doc: dict[str, Any], max_chars: int) -> tuple[str, bool]:
 
     chunks: list[str] = []
     for slide in slides:
-        text = strip_admin_lines((slide.get("text") or "").strip())
-        notes = strip_admin_lines((slide.get("notes") or "").strip())
+        text = (slide.get("text") or "").strip()
+        notes = (slide.get("notes") or "").strip()
         if not text and not notes:
             continue
         body = text
@@ -396,9 +395,9 @@ def local_notes(
         remaining_slides = max(1, len(slides) - slide_position)
         budget_left = global_cap - produced
         title = (slide.get("title") or "").strip()
-        if title.strip().lower() in SKIP_TITLES or is_admin_heading(title):
+        if title.strip().lower() in SKIP_TITLES:
             continue
-        raw = strip_admin_lines((slide.get("text") or "").strip())
+        raw = (slide.get("text") or "").strip()
         if not raw:
             continue
         raw_lines = [line for line in raw.splitlines() if line.strip()]
@@ -411,7 +410,7 @@ def local_notes(
             key = _normalize(sentence)
             if len(key) < 6 or key in seen or key == title_key:
                 continue
-            if key in noise_lines or _is_layout_noise(sentence) or is_admin_text(sentence):
+            if key in noise_lines or _is_layout_noise(sentence):
                 continue
             seen.add(key)
             score = _score_sentence(sentence, title, position)

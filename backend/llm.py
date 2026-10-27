@@ -195,7 +195,7 @@ async def complete_chat(
     """Collect a streaming completion into a complete string.
 
     Some OpenAI-compatible gateways only implement the streaming endpoint
-    reliably.  Chat already uses that path, so quizzes use the same
+    reliably.  Chat already uses that path, so plans/quizzes use the same
     transport and apply bounded retries around it.
     """
     call_config = config

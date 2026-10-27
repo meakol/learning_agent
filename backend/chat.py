@@ -73,12 +73,13 @@ def retrieve(
     return hits, actual_mode, reason
 
 
-def load_history(doc_id: str) -> list[dict[str, Any]]:
-    return progress.load_chat(doc_id)
+def load_history(doc_id: str, plan_id: str | None = None) -> list[dict[str, Any]]:
+    return progress.load_chat(doc_id, plan_id)
 
 
 def append_history(
     doc_id: str,
+    plan_id: str | None,
     question: str,
     answer: str,
     citations: list[int],
@@ -88,6 +89,7 @@ def append_history(
     now = datetime.now().astimezone().isoformat(timespec="seconds")
     progress.append_chat(
         doc_id,
+        plan_id,
         [
             {"role": "user", "content": question, "timestamp": now},
             {
@@ -100,8 +102,8 @@ def append_history(
     )
 
 
-def clear_history(doc_id: str) -> None:
-    progress.clear_chat(doc_id)
+def clear_history(doc_id: str, plan_id: str | None = None) -> None:
+    progress.clear_chat(doc_id, plan_id)
 
 
 def build_messages(
