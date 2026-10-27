@@ -55,6 +55,7 @@
     fallbackBtn: $("fallbackBtn"),
     noteStats: $("noteStats"),
     notesFooter: $("notesFooter"),
+    sectionProgress: $("sectionProgress"),
     splitter: $("splitter"),
     dropOverlay: $("dropOverlay"),
     toasts: $("toasts"),
@@ -109,6 +110,11 @@
     generating: false,
     stopped: false,
     markdown: "",
+    sections: [],
+    sectionSignature: "",
+    sectionLevel: 2,
+    sectionDom: [],
+    sectionError: "",
     controller: null,
     pendingRender: 0,
     autoFollow: true,
@@ -489,11 +495,18 @@
     }
     state.markdown = "";
     state.noteMode = "";
+    state.sections = [];
+    state.sectionSignature = "";
+    state.sectionLevel = 2;
+    state.sectionDom = [];
+    state.sectionError = "";
+    sectionSyncKey = "";
     els.notesBody.innerHTML = "";
     els.notesBody.hidden = true;
     els.errorCard.hidden = true;
     els.notesFooter.hidden = true;
     els.noteStats.textContent = "";
+    updateSectionProgress();
     setNoteActions(false);
     els.notesEmpty.hidden = false;
     setNotesEmptyMode("doc");
@@ -1124,6 +1137,246 @@
     if (on) setNoteActions(false);
   }
 
+  // ------------------------------------------------------------------------- //
+  // Note sections: the notes outline doubles as the study checklist.
+  // ------------------------------------------------------------------------- //
+  let sectionSyncKey = "";
+  let sectionSyncTimer = 0;
+  let sectionErrorNotified = false;
+
+  function noteSignature() {
+    return state.lang + "|" + state.level;
+  }
+
+  function normalizeTitle(value) {
+    return String(value || "").replace(/\s+/g, " ").trim();
+  }
+
+  function collectSections() {
+    if (!state.markdown.trim() || !window.NotesMarkdown || !NotesMarkdown.sections) return [];
+    return NotesMarkdown.sections(state.markdown).map(function (item) {
+      return {
+        title: normalizeTitle(item.title).slice(0, 80),
+        pages: (item.pages || []).slice(0, 60),
+        level: item.level,
+        domIndex: item.domIndex
+      };
+    }).filter(function (item) {
+      return item.title && item.pages.length;
+    }).slice(0, 60);
+  }
+
+  function updateSectionProgress() {
+    if (!els.sectionProgress) return;
+    if (state.sectionError) {
+      els.sectionProgress.hidden = false;
+      els.sectionProgress.textContent = state.sectionError;
+      els.sectionProgress.classList.remove("all-done");
+      return;
+    }
+    const sections = state.sections || [];
+    if (!sections.length) {
+      els.sectionProgress.hidden = true;
+      els.sectionProgress.textContent = "";
+      return;
+    }
+    const done = sections.filter(function (item) { return item.completed; }).length;
+    els.sectionProgress.hidden = false;
+    els.sectionProgress.textContent = "章节 " + done + "/" + sections.length + " 已完成";
+    els.sectionProgress.classList.toggle("all-done", done === sections.length);
+  }
+
+  function decorateSections() {
+    if (!els.notesBody || state.generating) return;
+    const sections = state.sections || [];
+    const dom = state.sectionDom || [];
+    const selector = state.sectionLevel >= 3 ? "h3" : "h2";
+    const headings = els.notesBody.querySelectorAll(selector);
+    Array.prototype.forEach.call(headings, function (heading, index) {
+      const position = dom.indexOf(index);
+      const item = position >= 0 ? sections[position] : null;
+      const existing = heading.querySelector(".section-check");
+      if (!item) {
+        if (existing) existing.remove();
+        const stale = heading.querySelector(".section-quiz-btn");
+        if (stale) stale.remove();
+        heading.classList.remove("is-complete");
+        return;
+      }
+      let label = existing;
+      if (!label) {
+        label = document.createElement("label");
+        label.className = "section-check";
+        label.title = "勾选表示该章节已学完；勾选后才能出题";
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        label.appendChild(box);
+        const mark = document.createElement("span");
+        mark.className = "section-check-mark";
+        label.appendChild(mark);
+        heading.insertBefore(label, heading.firstChild);
+      }
+      const input = label.querySelector("input");
+      input.dataset.sectionId = item.section_id || "";
+      input.checked = Boolean(item.completed);
+      input.disabled = !item.section_id;
+      heading.classList.toggle("is-complete", Boolean(item.completed));
+
+      let quizBtn = heading.querySelector(".section-quiz-btn");
+      if (!quizBtn) {
+        quizBtn = document.createElement("button");
+        quizBtn.type = "button";
+        quizBtn.className = "section-quiz-btn";
+        quizBtn.textContent = "生成测试";
+        quizBtn.title = "跳到章节测试，并为该章节出题";
+        heading.appendChild(quizBtn);
+        quizBtn.addEventListener("click", function (event) {
+          event.preventDefault();
+          event.stopPropagation();
+          const box = label.querySelector("input");
+          requestSectionQuiz(box ? box.dataset.sectionId : "");
+        });
+      }
+      quizBtn.disabled = !item.section_id;
+    });
+  }
+
+  function requestSectionQuiz(sectionId) {
+    if (!state.doc || !sectionId) {
+      toast("章节还没注册好，请稍后再试。", "error");
+      return;
+    }
+    document.dispatchEvent(new CustomEvent("notes:quiz-request", {
+      detail: {
+        doc_id: state.doc.doc_id,
+        signature: noteSignature(),
+        section_id: sectionId
+      }
+    }));
+  }
+
+
+  function scheduleSectionSync() {
+    if (!state.doc || !state.markdown.trim() || state.generating) return;
+    if (sectionSyncTimer) clearTimeout(sectionSyncTimer);
+    sectionSyncTimer = setTimeout(function () {
+      sectionSyncTimer = 0;
+      syncSections();
+    }, 240);
+  }
+
+  function dispatchSectionsChanged(signature, summary) {
+    document.dispatchEvent(new CustomEvent("notes:sections-changed", {
+      detail: {
+        doc_id: state.doc ? state.doc.doc_id : "",
+        signature: signature,
+        sections: state.sections || [],
+        summary: summary || null
+      }
+    }));
+  }
+
+  async function syncSections() {
+    if (!state.doc || !state.markdown.trim() || state.generating) return;
+    const signature = noteSignature();
+    const raw = collectSections();
+    state.sectionLevel = raw.length && raw[0].level >= 3 ? 3 : 2;
+    const key = [state.doc.doc_id, signature, raw.length, state.markdown.length].join("|");
+    if (key === sectionSyncKey && state.sectionSignature === signature) {
+      decorateSections();
+      updateSectionProgress();
+      return;
+    }
+    sectionSyncKey = key;
+    try {
+      const response = await fetch("/api/sections", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          doc_id: state.doc.doc_id,
+          signature: signature,
+          sections: raw
+        })
+      });
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      const data = await response.json();
+      if (!state.doc || noteSignature() !== signature) return;
+      state.sections = data.sections || [];
+      state.sectionSignature = signature;
+      state.sectionError = "";
+      sectionErrorNotified = false;
+      // Match each registered section back to its heading, even if the server
+      // dropped an item during validation.
+      state.sectionDom = state.sections.map(function (item, index) {
+        var pageKey = (item.pages || []).join(",");
+        for (var i = 0; i < raw.length; i += 1) {
+          if (normalizeTitle(raw[i].title) === normalizeTitle(item.title) &&
+              (raw[i].pages || []).join(",") === pageKey) {
+            return raw[i].domIndex;
+          }
+        }
+        // Server order matches the posted order, so fall back to position.
+        return raw[index] ? raw[index].domIndex : -1;
+      });
+      decorateSections();
+      updateSectionProgress();
+      dispatchSectionsChanged(signature, data.summary);
+    } catch (error) {
+      sectionSyncKey = "";
+      state.sectionSignature = "";
+      state.sectionError = "章节注册失败：" + (error && error.message ? error.message : "网络错误");
+      if (!sectionErrorNotified) {
+        sectionErrorNotified = true;
+        toast(state.sectionError + "（请重启后端服务后刷新页面）", "error", 7000);
+      }
+      // Keep the checklist visible (disabled) so the notes UI never disappears.
+      state.sections = raw.map(function (item) {
+        return {
+          section_id: "",
+          title: item.title,
+          pages: item.pages,
+          level: item.level,
+          completed: false
+        };
+      });
+      state.sectionDom = raw.map(function (item) { return item.domIndex; });
+      decorateSections();
+      updateSectionProgress();
+    }
+  }
+
+  async function toggleSection(sectionId, completed) {
+    if (!state.doc || !sectionId) return;
+    const signature = noteSignature();
+    try {
+      const response = await fetch(
+        "/api/sections/" + encodeURIComponent(state.doc.doc_id) + "/toggle",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            signature: signature,
+            section_id: sectionId,
+            completed: Boolean(completed)
+          })
+        }
+      );
+      if (!response.ok) throw new Error("toggle request failed");
+      const data = await response.json();
+      state.sections = data.sections || [];
+      state.sectionSignature = signature;
+      decorateSections();
+      updateSectionProgress();
+      dispatchSectionsChanged(signature, data.summary);
+    } catch (error) {
+      sectionSyncKey = "";
+      decorateSections();
+      toast("章节进度保存失败，请重试。", "error");
+    }
+  }
+
+
+
   function updateNoteMeta() {
     const counts = NotesMarkdown.stats(state.markdown);
     const total = counts.core + counts.key + counts.info;
@@ -1143,6 +1396,10 @@
     els.notesBody.hidden = false;
     els.notesEmpty.hidden = true;
     updateNoteMeta();
+    if (!state.generating) {
+      decorateSections();
+      scheduleSectionSync();
+    }
     if (state.autoFollow || nearBottom) {
       scroller.scrollTop = scroller.scrollHeight;
     }
@@ -1745,6 +2002,12 @@
         if (figure && figure.dataset.page) goToPage(figure.dataset.page, { flash: true });
       }
     });
+    els.notesBody.addEventListener("change", function (event) {
+      const input = event.target.closest && event.target.closest("input[data-section-id]");
+      if (!input) return;
+      toggleSection(input.dataset.sectionId, input.checked);
+    });
+
     els.notesScroll.addEventListener("scroll", function () {
       const scroller = els.notesScroll;
       state.autoFollow =
@@ -1882,6 +2145,16 @@
 
   window.NotesApp = {
     getDoc: function () { return state.doc; },
+    getSignature: noteSignature,
+    getSections: function () { return state.sections || []; },
+    getSectionError: function () { return state.sectionError || ""; },
+    refreshSections: function () {
+      sectionSyncKey = "";
+      return syncSections();
+    },
+    setSectionCompleted: function (sectionId, completed) {
+      return toggleSection(sectionId, Boolean(completed));
+    },
     goToPage: function (page, options) { return goToPage(page, options); },
     toast: toast
   };

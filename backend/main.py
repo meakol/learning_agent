@@ -21,7 +21,8 @@ from .config import (
     pricing_for,
     settings,
 )
-from . import chat, plans, progress, quiz
+from . import chat, quiz
+from . import sections as section_store
 from .llm import LLMConfig, LLMError, stream_chat
 from .logging_utils import TraceIdMiddleware, setup_logging
 from .notes import LEVELS, build_messages, level_info, local_notes
@@ -55,27 +56,32 @@ class NotesRequest(BaseModel):
     api: ApiConfig | None = None
 
 
-class PlanRequest(BaseModel):
+class SectionItem(BaseModel):
+    section_id: str | None = None
+    title: str = Field(default="", max_length=80)
+    pages: list[int] = Field(default_factory=list, max_length=60)
+    level: int = Field(default=2, ge=1, le=6)
+
+
+class SectionsRequest(BaseModel):
     doc_id: str
-    user_id: str = "local"
-    total_days: int = Field(ge=1, le=30)
-    daily_minutes: int = Field(ge=10, le=480)
-    difficulty: int = Field(default=3, ge=1, le=5)
-    force_fallback: bool = False
-    api: ApiConfig | None = None
+    signature: str = "zh|3"
+    sections: list[SectionItem] = Field(default_factory=list, max_length=60)
 
 
-class ProgressPageRequest(BaseModel):
-    page: int = Field(ge=1)
+class SectionToggleRequest(BaseModel):
+    signature: str = "zh|3"
+    section_id: str = Field(min_length=1, max_length=32)
     completed: bool = True
 
 
 class QuizRequest(BaseModel):
     doc_id: str
-    plan_id: str
-    milestone_id: str
+    signature: str = "zh|3"
+    section_ids: list[str] = Field(default_factory=list, max_length=60)
     question_count: int = Field(default=5, ge=1, le=10)
     difficulty: Literal["easy", "medium", "hard"] = "medium"
+    language: Literal["zh", "en"] = "zh"
     force: bool = False
     force_fallback: bool = False
     api: ApiConfig | None = None
@@ -101,7 +107,6 @@ class EmbeddingConfig(BaseModel):
 class ChatRequest(BaseModel):
     doc_id: str
     user_id: str = "local"
-    plan_id: str | None = None
     message: str = Field(min_length=1, max_length=500)
     conversation_history: list[dict] | None = None
     api: ApiConfig | None = None
@@ -159,7 +164,7 @@ async def health() -> dict:
         "retrieval_mode": settings.retrieval_mode,
         "pipeline_enabled": settings.pipeline_enabled,
         "llm_transport": "stream",
-        "plan_timeout_seconds": settings.plan_timeout_seconds,
+        "quiz_temperature": settings.quiz_temperature,
         "quiz_timeout_seconds": settings.quiz_timeout_seconds,
     }
 
@@ -193,7 +198,13 @@ async def public_config() -> dict:
             "max_pages_per_chunk": settings.pipeline_max_pages_per_chunk,
             "concurrency": settings.pipeline_concurrency,
         },
-        "learning": {"max_plans_per_doc": 50, "max_questions_per_quiz": 10},
+        "learning": {
+            "max_sections": 60,
+            "max_questions_per_quiz": 10,
+            "quiz_languages": ["zh", "en"],
+            "quiz_temperature": settings.quiz_temperature,
+            "quiz_apply_ratio": quiz.APPLY_RATIO,
+        },
     }
 
 
@@ -515,20 +526,24 @@ async def notes_stream(payload: NotesRequest, request: Request) -> StreamingResp
 
 
 # --------------------------------------------------------------------------- #
-# Learning features: documents, plans, progress, quizzes, retrieval, chat
+# Learning features: documents, sections, quizzes, retrieval, chat
 # --------------------------------------------------------------------------- #
-def _plan_or_404(plan_id: str) -> dict:
-    plan = plans.get_plan(plan_id)
-    if not plan:
-        raise HTTPException(404, "计划不存在或已删除。")
-    return plan
-
-
 def _doc_or_404(doc_id: str) -> dict:
     doc = store.get(doc_id)
     if not doc:
         raise HTTPException(404, "课件不存在或已过期，请重新上传。")
     return doc
+
+
+def _sections_payload(doc_id: str, signature: str) -> dict:
+    data = section_store.load_sections(doc_id, signature)
+    progress_data = section_store.load_progress(doc_id, signature)
+    return {
+        "doc_id": doc_id,
+        "signature": section_store.normalize_signature(signature),
+        "sections": section_store.section_states(data, progress_data),
+        "summary": section_store.summary(data, progress_data),
+    }
 
 
 @app.get("/api/docs")
@@ -545,185 +560,125 @@ async def delete_doc(doc_id: str) -> dict:
     return {"ok": True, "doc_id": doc_id}
 
 
-@app.post("/api/plan")
-async def create_plan(payload: PlanRequest) -> JSONResponse:
+@app.post("/api/sections")
+async def register_sections(payload: SectionsRequest) -> dict:
     doc = _doc_or_404(payload.doc_id)
-    started = time.perf_counter()
-    plan = await plans.create_plan(
-        doc,
-        payload.total_days,
-        payload.daily_minutes,
-        payload.difficulty,
-        _resolve_api(payload.api),
-        payload.force_fallback,
+    section_store.save_sections(
+        doc["doc_id"],
+        payload.signature,
+        [item.model_dump() for item in payload.sections],
+        int(doc.get("page_count") or 0),
     )
-    plans.save_plan(plan)
-    result = dict(plan)
-    result["generated_in_seconds"] = round(time.perf_counter() - started, 2)
-    return JSONResponse(result, status_code=201)
+    return _sections_payload(doc["doc_id"], payload.signature)
 
 
-@app.get("/api/doc/{doc_id}/plans")
-async def list_plans(doc_id: str) -> dict:
+@app.get("/api/sections")
+async def get_sections(doc_id: str, signature: str = "zh|3") -> dict:
     _doc_or_404(doc_id)
-    index = progress.load_index(doc_id)
-    return {
-        "doc_id": doc_id,
-        "active_plan_id": index.get("active_plan_id"),
-        "plans": plans.list_plans(doc_id),
-    }
+    return _sections_payload(doc_id, signature)
 
 
-@app.get("/api/plan/{plan_id}")
-async def get_plan(plan_id: str) -> dict:
-    return _plan_or_404(plan_id)
-
-
-@app.post("/api/plan/{plan_id}/activate")
-async def activate_plan(plan_id: str) -> dict:
-    result = plans.activate_plan(plan_id)
-    if not result:
-        raise HTTPException(404, "计划不存在或已删除。")
-    return result
-
-
-@app.delete("/api/plan/{plan_id}")
-async def delete_plan(plan_id: str) -> dict:
-    result = plans.delete_plan(plan_id)
-    if not result:
-        raise HTTPException(404, "计划不存在或已删除。")
-    return result
-
-
-@app.get("/api/progress/{doc_id}/{plan_id}")
-async def get_progress(doc_id: str, plan_id: str) -> dict:
-    plan = _plan_or_404(plan_id)
-    if plan.get("doc_id") != doc_id:
-        raise HTTPException(404, "计划不存在或已删除。")
-    data = progress.ensure_progress(doc_id, plan_id)
-    return {
-        "progress": data,
-        "milestone_states": progress.milestone_states(plan, data),
-        "summary": progress.summary(plan, data),
-    }
-
-
-@app.post("/api/progress/{doc_id}/{plan_id}/page")
-async def update_progress(doc_id: str, plan_id: str, payload: ProgressPageRequest) -> dict:
-    plan = _plan_or_404(plan_id)
-    if plan.get("doc_id") != doc_id:
-        raise HTTPException(404, "计划不存在或已删除。")
-    if payload.page < 1 or payload.page > int(plan.get("total_pages") or 0):
-        raise HTTPException(400, "页面超出计划范围。")
-    data, states, event = progress.update_page(
-        doc_id, plan_id, plan, payload.page, payload.completed
+@app.post("/api/sections/{doc_id}/toggle")
+async def toggle_section(doc_id: str, payload: SectionToggleRequest) -> dict:
+    _doc_or_404(doc_id)
+    data = section_store.load_sections(doc_id, payload.signature)
+    if not data:
+        raise HTTPException(404, "章节尚未注册，请先生成笔记。")
+    known = {item["section_id"] for item in data.get("sections") or []}
+    if payload.section_id not in known:
+        raise HTTPException(404, "章节不存在，请重新生成笔记。")
+    section_store.toggle_section(
+        doc_id, data["signature"], payload.section_id, payload.completed
     )
-    return {
-        "progress": data,
-        "milestone_states": states,
-        "summary": progress.summary(plan, data),
-        **event,
-    }
-
-
-def _active_plan_id(doc_id: str, requested: str | None) -> str | None:
-    if requested:
-        return requested
-    return progress.load_index(doc_id).get("active_plan_id")
+    return _sections_payload(doc_id, data["signature"])
 
 
 @app.post("/api/quiz")
 async def create_quiz(payload: QuizRequest) -> JSONResponse:
     doc = _doc_or_404(payload.doc_id)
-    plan = _plan_or_404(payload.plan_id)
-    if plan.get("doc_id") != doc["doc_id"]:
-        raise HTTPException(404, "计划不存在或已删除。")
-    milestone = next(
-        (item for item in plan.get("milestones", []) if item.get("milestone_id") == payload.milestone_id),
-        None,
-    )
-    if not milestone:
-        raise HTTPException(404, "里程碑不存在。")
-    data = progress.ensure_progress(doc["doc_id"], plan["plan_id"])
-    states = progress.milestone_states(plan, data)
-    state = next((item for item in states if item["milestone_id"] == payload.milestone_id), None)
-    last_id = plan["milestones"][-1]["milestone_id"] if plan.get("milestones") else None
-    if payload.milestone_id != last_id and state and not state.get("completed"):
-        raise HTTPException(409, "完成该里程碑后才能测试。")
+    data = section_store.load_sections(doc["doc_id"], payload.signature)
+    if not data:
+        raise HTTPException(409, "先生成笔记并注册章节，才能出题。")
+    progress_data = section_store.load_progress(doc["doc_id"], data["signature"])
+    states = {
+        item["section_id"]: item
+        for item in section_store.section_states(data, progress_data)
+    }
+    wanted = [sid for sid in dict.fromkeys(payload.section_ids) if sid]
+    if not wanted:
+        raise HTTPException(400, "请选择要测试的章节。")
+    if any(sid not in states for sid in wanted):
+        raise HTTPException(404, "章节不存在，请重新生成笔记。")
+    pending = [states[sid]["title"] for sid in wanted if not states[sid]["completed"]]
+    if pending:
+        raise HTTPException(409, "请先在笔记中勾选完成：" + "、".join(pending[:3]))
+    sections = [states[sid] for sid in wanted]
     api = _resolve_api(payload.api)
     cached = None
     if not payload.force:
         candidate = quiz._cache_match(
             doc["doc_id"],
-            plan["plan_id"],
-            payload.milestone_id,
+            data["signature"],
+            wanted,
             payload.difficulty,
             payload.question_count,
+            payload.language,
         )
         if candidate and (candidate.get("source") != "fallback" or not api.api_key):
             cached = candidate
-    result = await quiz.generate_quiz(
+    result = cached or await quiz.generate_quiz(
         doc,
-        plan,
-        milestone,
+        sections,
+        data["signature"],
         payload.question_count,
         payload.difficulty,
+        payload.language,
         api,
         payload.force,
         payload.force_fallback,
     )
     status = 201 if not cached else 200
-    return JSONResponse({"cached": bool(cached), "quiz": quiz.sanitize_quiz(result)}, status_code=status)
+    return JSONResponse(
+        {"cached": bool(cached), "quiz": quiz.sanitize_quiz(result)}, status_code=status
+    )
 
 
 @app.get("/api/quiz/history")
-async def quiz_history(doc_id: str, plan_id: str, milestone_id: str | None = None) -> dict:
-    doc = _doc_or_404(doc_id)
-    plan = _plan_or_404(plan_id)
-    if plan.get("doc_id") != doc["doc_id"]:
-        raise HTTPException(404, "计划不存在或已删除。")
-    milestones = {item.get("milestone_id"): item for item in plan.get("milestones", [])}
-    if milestone_id and milestone_id not in milestones:
-        raise HTTPException(404, "里程碑不存在。")
-    progress_data = progress.load_progress(doc_id, plan_id)
-    all_results = list(progress_data.get("quiz_results") or [])
-    results = [
-        item for item in all_results
-        if not milestone_id or item.get("milestone_id") == milestone_id
-    ]
-    result_by_quiz = {}
-    for item in results:
-        if item.get("quiz_id"):
-            result_by_quiz[item["quiz_id"]] = item
-    last_result = results[-1] if results else None
-    candidates = quiz.list_for_plan(doc_id, plan_id, milestone_id)
-    latest = quiz.latest_for_milestone(
-        doc_id,
-        plan_id,
-        milestone_id,
-        preferred_quiz_id=last_result.get("quiz_id") if last_result else None,
-    ) if milestone_id else (candidates[0] if candidates else None)
+async def quiz_history(doc_id: str, signature: str = "zh|3", section_id: str | None = None) -> dict:
+    _doc_or_404(doc_id)
+    signature = section_store.normalize_signature(signature)
+    candidates = quiz.list_for_doc(doc_id, signature)
+    if section_id:
+        candidates = [
+            item for item in candidates if section_id in (item.get("section_ids") or [])
+        ]
+    latest = quiz.latest_for_doc(doc_id, signature)
+    if section_id:
+        latest = next(
+            (item for item in candidates if item.get("status") == "ready"),
+            candidates[0] if candidates else None,
+        )
     records = []
     for item in candidates:
-        result = result_by_quiz.get(item.get("quiz_id"))
         records.append(
             {
                 "quiz_id": item.get("quiz_id"),
-                "plan_id": item.get("plan_id"),
-                "milestone_id": item.get("milestone_id"),
-                "milestone_title": (milestones.get(item.get("milestone_id")) or {}).get("title", ""),
+                "section_ids": item.get("section_ids") or [],
+                "section_titles": item.get("section_titles") or [],
+                "language": item.get("language") or "zh",
                 "created_at": item.get("created_at"),
                 "difficulty": item.get("difficulty"),
                 "question_count_actual": item.get("question_count_actual", 0),
                 "status": item.get("status"),
                 "source": item.get("source"),
-                "result": result,
+                "result": item.get("result"),
                 "quiz": quiz.sanitize_quiz(item),
             }
         )
     return {
+        "signature": signature,
         "quiz": quiz.sanitize_quiz(latest) if latest else None,
-        "result": result_by_quiz.get(latest.get("quiz_id")) if latest else last_result,
+        "result": latest.get("result") if latest else None,
         "records": records,
     }
 
@@ -750,7 +705,7 @@ async def submit_quiz(quiz_id: str, payload: QuizSubmit) -> dict:
         if code == "INCOMPLETE_ANSWERS":
             raise HTTPException(400, "请提交全部题目。") from exc
         raise HTTPException(400, "答案无效。") from exc
-    progress.add_quiz_result(data["doc_id"], data["plan_id"], result)
+    quiz.save_result(data, result)
     return result
 
 
@@ -787,19 +742,16 @@ async def retrieval_check(payload: CheckRequest) -> dict:
 
 
 @app.get("/api/chat/history")
-async def chat_history(doc_id: str, plan_id: str | None = None) -> dict:
+async def chat_history(doc_id: str) -> dict:
     _doc_or_404(doc_id)
-    plan = _active_plan_id(doc_id, plan_id)
-    messages = chat.load_history(doc_id, plan)
-    return {"doc_id": doc_id, "plan_id": plan, "messages": messages}
+    return {"doc_id": doc_id, "messages": chat.load_history(doc_id)}
 
 
 @app.delete("/api/chat/history")
-async def clear_chat_history(doc_id: str, plan_id: str | None = None) -> dict:
+async def clear_chat_history(doc_id: str) -> dict:
     _doc_or_404(doc_id)
-    plan = _active_plan_id(doc_id, plan_id)
-    chat.clear_history(doc_id, plan)
-    return {"ok": True, "doc_id": doc_id, "plan_id": plan}
+    chat.clear_history(doc_id)
+    return {"ok": True, "doc_id": doc_id}
 
 
 @app.post("/api/chat/stream")
@@ -812,10 +764,7 @@ async def chat_stream(payload: ChatRequest, request: Request) -> StreamingRespon
         raise HTTPException(503, "未配置模型 API Key，无法问答。")
     if len(doc.get("slides") or []) < 1 or int((doc.get("stats") or {}).get("chars") or 0) < 20:
         raise HTTPException(409, "当前课件没有可检索文字。")
-    plan_id = _active_plan_id(doc["doc_id"], payload.plan_id)
-    if plan_id and not plans.get_plan(plan_id):
-        raise HTTPException(404, "计划不存在或已删除。")
-    history = chat.load_history(doc["doc_id"], plan_id)
+    history = chat.load_history(doc["doc_id"])
     embedding = payload.embedding.model_dump() if payload.embedding else None
     hits, mode, degraded_reason = await asyncio.to_thread(
         chat.retrieve, doc, payload.message, None, payload.retrieval_mode, embedding
@@ -833,7 +782,6 @@ async def chat_stream(payload: ChatRequest, request: Request) -> StreamingRespon
                 "mode": "llm",
                 "model": api.model,
                 "doc_id": doc["doc_id"],
-                "plan_id": plan_id,
                 "retrieval_mode": mode,
                 "degraded": bool(degraded_reason),
                 "degraded_reason": degraded_reason,
@@ -874,7 +822,7 @@ async def chat_stream(payload: ChatRequest, request: Request) -> StreamingRespon
         grounded, citations = chat.validate_citations(answer, hits)
         if not grounded and not general_knowledge:
             yield _sse({"type": "delta", "text": "\n\n> 引用校验未通过，建议重试。"})
-        chat.append_history(doc["doc_id"], plan_id, payload.message, answer, citations)
+        chat.append_history(doc["doc_id"], payload.message, answer, citations)
         actual_input = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
         actual_output = usage.get("completion_tokens") or usage.get("output_tokens") or estimate_tokens(len(answer))
         yield _sse(

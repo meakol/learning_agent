@@ -3,7 +3,9 @@ from __future__ import annotations
 import re
 from typing import Iterable
 
-from .text_utils import strip_banned_phrases
+from .text_utils import is_admin_heading, is_admin_text, strip_banned_phrases
+
+_HEADING_LINE_RE = re.compile(r"^\s*(#{1,6})\s+(.*)$")
 
 # N2 protects Markdown structures before splitting, then restores them verbatim.
 _PROTECT_PATTERNS = (
@@ -177,6 +179,62 @@ def _process_line(line: str, language: str) -> list[str]:
     return ["\n\n".join(_join_sentences(split_sentences[index:index + 3]) for index in range(0, len(split_sentences), 3))]
 
 
+def _strip_admin_blocks(text: str) -> str:
+    """Drop logistics headings (with their bodies) and stray logistics lines."""
+    lines = text.split("\n")
+    output: list[str] = []
+    skipping = 0
+    for line in lines:
+        match = _HEADING_LINE_RE.match(line)
+        if match:
+            level = len(match.group(1))
+            if skipping and level > skipping:
+                continue
+            skipping = 0
+            if is_admin_heading(match.group(2)):
+                skipping = level
+                continue
+        elif skipping:
+            continue
+        stripped = line.strip()
+        if stripped and not stripped.startswith(("|", ":::")) and is_admin_text(stripped):
+            continue
+        output.append(line)
+    return "\n".join(output)
+
+
+def _drop_empty_sections(text: str) -> str:
+    """Remove a heading when everything under it was filtered out."""
+    lines = text.split("\n")
+    output: list[str] = []
+    index = 0
+    while index < len(lines):
+        match = _HEADING_LINE_RE.match(lines[index])
+        if not match or len(match.group(1)) < 2:
+            output.append(lines[index])
+            index += 1
+            continue
+        level = len(match.group(1))
+        end = index + 1
+        body: list[str] = []
+        while end < len(lines):
+            inner = _HEADING_LINE_RE.match(lines[end])
+            if inner and len(inner.group(1)) <= level:
+                break
+            body.append(lines[end])
+            end += 1
+        meaningful = [
+            line
+            for line in body
+            if line.strip()
+            and not re.fullmatch(r"\s*\[\[VISUAL[^\]]*\]\]\s*", line.strip())
+        ]
+        if meaningful:
+            output.extend(lines[index:end])
+        index = end
+    return "\n".join(output)
+
+
 def _dedupe_blocks(text: str) -> str:
     blocks = re.split(r"\n{2,}", text)
     result: list[str] = []
@@ -198,6 +256,7 @@ def postprocess(text: str, banned_phrases: Iterable[str] | None = None, language
     if not source.strip():
         return ""
     protected, saved = _protect(source)
+    protected = _strip_admin_blocks(protected)
     protected = strip_banned_phrases(protected, banned_phrases or [])
     lines = protected.split("\n")
     output: list[str] = []
@@ -209,4 +268,5 @@ def postprocess(text: str, banned_phrases: Iterable[str] | None = None, language
     processed = "\n".join(output)
     processed = re.sub(r"\n{3,}", "\n\n", processed).strip()
     processed = _dedupe_blocks(processed)
+    processed = _drop_empty_sections(processed)
     return _restore(processed, saved).strip()

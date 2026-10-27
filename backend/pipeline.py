@@ -9,6 +9,7 @@ from .llm import LLMConfig, LLMError, stream_chat
 from .notes import build_chunk_messages, local_notes
 from .postprocess import postprocess
 from .prompts import load
+from .text_utils import strip_admin_lines
 
 
 @dataclass(frozen=True)
@@ -22,8 +23,8 @@ class Chunk:
 
 
 def _page_body(slide: dict[str, Any]) -> str:
-    text = (slide.get("text") or "").strip()
-    notes = (slide.get("notes") or "").strip()
+    text = strip_admin_lines((slide.get("text") or "").strip())
+    notes = strip_admin_lines((slide.get("notes") or "").strip())
     if notes:
         text = f"{text}\n[讲者备注] {notes}" if text else f"[讲者备注] {notes}"
     return text

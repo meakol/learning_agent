@@ -595,5 +595,109 @@
     return counts;
   }
 
-  global.NotesMarkdown = { render: render, stats: stats, escapeHtml: escapeHtml };
+  var SECTION_PAGE_RE = /\[p{1,2}\.?\s*(\d+)(?:\s*[-–—~]\s*(\d+))?\]|\[第\s*(\d+)\s*页\]/gi;
+  var SECTION_TAG_RE = /\[p{1,2}\.?\s*\d+(?:\s*[-–—~]\s*\d+)?\]|\[第\s*\d+\s*页\]/gi;
+  var ADMIN_TITLE_RE = /课程(安排|计划|大纲|进度|信息|须知)|教学(安排|计划|大纲)|考核方式|评分标准|成绩构成|考试安排|考试时间|参考(书|文献)|推荐阅读|联系方式|答疑时间|课程目标|作业要求|attendance|grading policy|course (schedule|outline|logistics|description)|syllabus/i;
+
+  function pagesInText(text) {
+    var pages = [];
+    var source = String(text || "");
+    var match;
+    SECTION_PAGE_RE.lastIndex = 0;
+    while ((match = SECTION_PAGE_RE.exec(source)) !== null) {
+      var start = parseInt(match[3] || match[1], 10);
+      if (!start) continue;
+      var end = match[3] ? start : (match[2] ? parseInt(match[2], 10) : start);
+      var low = Math.min(start, end);
+      var high = Math.min(Math.max(start, end), low + 40);
+      for (var page = low; page <= high; page += 1) pages.push(page);
+    }
+    return pages;
+  }
+
+  function sections(markdown) {
+    var text = String(markdown || "").replace(/\r\n?/g, "\n");
+    var lines = text.split("\n");
+    var level2 = [];
+    var level3 = [];
+    var current2 = null;
+    var current3 = null;
+    var fence = false;
+
+    lines.forEach(function (line) {
+      var trimmed = line.trim();
+      if (trimmed.indexOf("```") === 0) {
+        fence = !fence;
+        return;
+      }
+      if (fence) return;
+      var heading = /^(#{2,4})\s+(.+)$/.exec(trimmed);
+      if (heading) {
+        var level = heading[1].length;
+        var title = heading[2].replace(SECTION_TAG_RE, "").trim();
+        var item = { title: title, level: level, pages: pagesInText(heading[2]), text: "" };
+        if (level === 2) {
+          item.domIndex = level2.length;
+          level2.push(item);
+          current2 = item;
+          current3 = null;
+        } else if (level === 3) {
+          item.domIndex = level3.length;
+          level3.push(item);
+          current3 = item;
+          if (current2) current2.pages = current2.pages.concat(item.pages);
+        } else {
+          current3 = item;
+        }
+        return;
+      }
+      if (current3) {
+        current3.text += line + "\n";
+        current3.pages = current3.pages.concat(pagesInText(line));
+      }
+      if (current2) {
+        current2.text += line + "\n";
+        current2.pages = current2.pages.concat(pagesInText(line));
+      }
+    });
+
+    var picked = level2.length ? level2 : level3;
+    var seen = {};
+    var result = [];
+    var lastPage = 0;
+    picked.forEach(function (item, index) {
+      var title = String(item.title || "").trim();
+      if (!title || ADMIN_TITLE_RE.test(title)) return;
+      var pages = [];
+      var seenPage = {};
+      item.pages.forEach(function (page) {
+        if (typeof page === "number" && !seenPage[page]) {
+          seenPage[page] = true;
+          pages.push(page);
+        }
+      });
+      pages.sort(function (a, b) { return a - b; });
+      if (!pages.length) pages = [lastPage || 1];
+      lastPage = pages[pages.length - 1];
+      var key = title + "|" + pages.join(",");
+      if (seen[key]) return;
+      seen[key] = true;
+      result.push({
+        index: index,
+        domIndex: typeof item.domIndex === "number" ? item.domIndex : index,
+        title: title,
+        level: item.level,
+        pages: pages,
+        text: String(item.text || "").trim()
+      });
+    });
+    return result;
+  }
+
+  global.NotesMarkdown = {
+    render: render,
+    stats: stats,
+    sections: sections,
+    escapeHtml: escapeHtml
+  };
 })(window);

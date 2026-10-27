@@ -82,8 +82,9 @@ class Settings:
     pipeline_concurrency: int = _env_int("PIPELINE_CONCURRENCY", 2)
     pipeline_max_retries: int = _env_int("PIPELINE_MAX_RETRIES", 2)
 
-    # Slow reasoning models often need >25s for a complete JSON plan/quiz.
-    plan_timeout_seconds: float = _env_float("PLAN_TIMEOUT_SECONDS", 60.0)
+    # Slow reasoning models often need >25s for a complete quiz JSON.
+    # 0.8 keeps scenarios fresh without breaking the JSON contract too often.
+    quiz_temperature: float = _env_float("QUIZ_TEMPERATURE", 0.8)
     quiz_timeout_seconds: float = _env_float("QUIZ_TIMEOUT_SECONDS", 120.0)
     chat_timeout_seconds: float = _env_float("CHAT_TIMEOUT_SECONDS", 30.0)
 

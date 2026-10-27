@@ -5,17 +5,18 @@
   var registry = new Set();
   var state = {
     doc: null,
-    plans: [],
-    activePlanId: null,
-    plan: null,
-    progress: null,
+    signature: "",
+    sections: [],
+    summary: null,
+    selectedSection: "",
+    sectionsError: "",
     quiz: null,
     quizRecords: [],
     quizAnswers: {},
     quizController: null,
-    autoQuizTimer: 0,
     chatController: null,
-    streaming: false
+    streaming: false,
+    workspace: "notes"
   };
 
   function escapeHtml(value) {
@@ -70,10 +71,10 @@
     return data;
   }
 
-  function switchWorkspace(name) {
+  function switchWorkspace(name, options) {
     state.workspace = name;
     var notes = $("notesPanel");
-    var panels = { plan: $("planPanel"), quiz: $("quizPanel"), chat: $("chatPanel") };
+    var panels = { quiz: $("quizPanel"), chat: $("chatPanel") };
     if (notes) notes.hidden = name !== "notes";
     Object.keys(panels).forEach(function (key) {
       if (panels[key]) panels[key].hidden = key !== name;
@@ -84,29 +85,16 @@
       button.setAttribute("aria-selected", active ? "true" : "false");
     });
     try { localStorage.setItem("ln_agent_workspace_v1", name); } catch (ignored) { /* ignore */ }
-    if (name !== "quiz") {
-      if (state.autoQuizTimer) {
-        clearTimeout(state.autoQuizTimer);
-        state.autoQuizTimer = 0;
-      }
-      if (state.quizController) {
-        state.quizController.abort();
-        state.quizController = null;
-      }
+    if (name !== "quiz" && state.quizController) {
+      state.quizController.abort();
+      state.quizController = null;
     }
-    if (name === "plan") loadPlans();
-    if (name === "quiz") loadQuizWorkspace();
+    if (name === "quiz" && !(options && options.skipLoad)) loadQuizWorkspace();
     if (name === "chat") loadChat();
   }
 
   function loadQuizWorkspace() {
-    return loadPlans()
-      .then(function () { return loadPlan(); })
-      .then(function () {
-        renderMilestones();
-        return loadQuizState();
-      })
-      .then(function () { return loadQuizHistory(); });
+    return Promise.all([loadSections(), loadQuizHistory()]);
   }
 
   function registerFeature(id, init) {
@@ -123,258 +111,205 @@
     return state.doc || (window.NotesApp && window.NotesApp.getDoc ? window.NotesApp.getDoc() : null);
   }
 
-  async function loadPlans() {
-    var doc = currentDoc();
-    var list = $("planList");
-    if (!list) return;
-    if (!doc) {
-      list.innerHTML = '<div class="learning-empty">先上传课件，再创建学习计划。</div>';
-      return;
-    }
+  function signature() {
     try {
-      var data = await api("/api/doc/" + encodeURIComponent(doc.doc_id) + "/plans");
-      state.plans = data.plans || [];
-      state.activePlanId = data.active_plan_id || null;
-      renderPlanList();
-      if (state.activePlanId) await loadPlan();
-    } catch (error) {
-      list.innerHTML = '<div class="learning-empty">' + escapeHtml(error.message) + "</div>";
-    }
-  }
-
-  function renderPlanList() {
-    var list = $("planList");
-    if (!list) return;
-    if (!state.plans.length) {
-      list.innerHTML = '<div class="learning-empty">还没有计划。设置天数与每天时长后生成。</div>';
-      return;
-    }
-    list.innerHTML = state.plans.map(function (plan) {
-      var active = plan.plan_id === state.activePlanId;
-      return '<div class="plan-row"><button type="button" class="plan-card' + (active ? " active" : "") + '" data-plan="' + escapeHtml(plan.plan_id) + '">' +
-        '<div class="plan-card-head"><h3>' + escapeHtml(plan.title) + '</h3><small>' + plan.total_milestones + ' 个里程碑</small></div>' +
-        '<small>' + plan.total_pages + ' 页 · ' + plan.estimated_days + ' 天 · ' + plan.progress.percent + '%</small>' +
-        '</button><button type="button" class="plan-delete" data-delete-plan="' + escapeHtml(plan.plan_id) + '" title="删除计划" aria-label="删除计划">✕</button></div>';
-    }).join("");
-    Array.prototype.forEach.call(list.querySelectorAll("[data-plan]"), function (button) {
-      button.addEventListener("click", function () {
-        state.activePlanId = button.dataset.plan;
-        api("/api/plan/" + encodeURIComponent(button.dataset.plan) + "/activate", {
-          method: "POST", headers: { "Content-Type": "application/json" }, body: "{}"
-        }).then(function () { return loadPlan(); })
-          .then(function () { renderPlanList(); return loadChat(); })
-          .catch(function (error) { notify(error.message); });
-      });
-    });
-    Array.prototype.forEach.call(list.querySelectorAll("[data-delete-plan]"), function (button) {
-      button.addEventListener("click", function (event) {
-        event.stopPropagation();
-        var planId = button.getAttribute("data-delete-plan");
-        if (!window.confirm("删除该计划及其进度与测试？此操作不可恢复。")) return;
-        button.disabled = true;
-        api("/api/plan/" + encodeURIComponent(planId), { method: "DELETE" })
-          .then(function () {
-            if (state.activePlanId === planId) {
-              state.activePlanId = null;
-              state.plan = null;
-              state.progress = null;
-              state.quiz = null;
-              var detail = $("planDetail");
-              if (detail) detail.innerHTML = '<div class="learning-empty">选择或创建一个计划。</div>';
-            }
-            return loadPlans();
-          })
-          .then(function () { notify("计划已删除。"); })
-          .catch(function (error) { button.disabled = false; notify(error.message); });
-      });
-    });
-  }
-
-  async function loadPlan() {
-    var doc = currentDoc();
-    var detail = $("planDetail");
-    if (!doc || !state.activePlanId) {
-      state.plan = null;
-      if (detail) detail.innerHTML = '<div class="learning-empty">选择或创建一个计划。</div>';
-      return null;
-    }
-    try {
-      state.plan = await api("/api/plan/" + encodeURIComponent(state.activePlanId));
-      state.progress = await api("/api/progress/" + encodeURIComponent(doc.doc_id) + "/" + encodeURIComponent(state.activePlanId));
-      renderPlanDetail();
-      return state.plan;
-    } catch (error) {
-      state.plan = null;
-      if (detail) detail.innerHTML = '<div class="learning-empty">' + escapeHtml(error.message) + "</div>";
-      return null;
-    }
-  }
-
-  function renderPlanDetail() {
-    var detail = $("planDetail");
-    if (!detail || !state.plan) return;
-    var states = {};
-    ((state.progress && state.progress.milestone_states) || []).forEach(function (item) {
-      states[item.milestone_id] = item;
-    });
-    var completed = (state.progress && state.progress.progress && state.progress.progress.completed_pages) || [];
-    var sourceLabel = state.plan.source === "fallback" ? "回退计划 · 模型未返回有效结果" : "模型生成计划";
-    detail.innerHTML = '<div class="learning-note">' + escapeHtml(sourceLabel) + '</div>' +
-      state.plan.milestones.map(function (milestone) {
-      var ms = states[milestone.milestone_id] || {};
-      var pages = [];
-      for (var page = milestone.page_range.start; page <= milestone.page_range.end; page += 1) {
-        pages.push('<label><input type="checkbox" data-page="' + page + '"' +
-          (completed.indexOf(page) !== -1 ? " checked" : "") + "> 第 " + page + " 页</label>");
+      if (window.NotesApp && window.NotesApp.getSignature) {
+        return String(window.NotesApp.getSignature() || "zh|3");
       }
-      return '<div class="milestone-card" data-milestone="' + escapeHtml(milestone.milestone_id) + '">' +
-        '<div class="milestone-title"><span>' + escapeHtml(milestone.title) + '</span><small>' +
-        (ms.completed ? "已完成" : (ms.quiz_available ? "可测试" : "进行中")) + '</small></div>' +
-        '<small>第 ' + milestone.page_range.start + '–' + milestone.page_range.end + ' 页 · ' +
-        milestone.estimated_minutes + ' 分钟</small>' +
-        '<div class="milestone-pages">' + pages.join("") + '</div></div>';
-    }).join("");
-    Array.prototype.forEach.call(detail.querySelectorAll("input[data-page]"), function (input) {
-      input.addEventListener("change", function () {
-        updatePage(Number(input.dataset.page), input.checked);
-      });
-    });
-  }
-
-  async function updatePage(page, completed) {
-    var doc = currentDoc();
-    if (!doc || !state.plan) return;
-    try {
-      var data = await api("/api/progress/" + encodeURIComponent(doc.doc_id) + "/" +
-        encodeURIComponent(state.plan.plan_id) + "/page", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ page: page, completed: completed })
-      });
-      state.progress = data;
-      renderPlanDetail();
-      if (completed && Array.isArray(data.milestone_completed) && data.milestone_completed.length) {
-        scheduleAutoQuiz(data.milestone_completed[0]);
-      }
-      await loadPlans();
-    } catch (error) {
-      notify(error.message);
-      renderPlanDetail();
-    }
-  }
-
-  function scheduleAutoQuiz(milestoneId) {
-    if (!state.doc || !state.plan || !milestoneId) return;
-    if (state.autoQuizTimer) clearTimeout(state.autoQuizTimer);
-    var planId = state.plan.plan_id;
-    var docId = state.doc.doc_id;
-    state.autoQuizTimer = setTimeout(function () {
-      state.autoQuizTimer = 0;
-      if (!state.doc || state.doc.doc_id !== docId || !state.plan || state.plan.plan_id !== planId) return;
-      var select = $("quizMilestoneSelect");
-      if (select && select.value && select.value !== milestoneId) return;
-      generateQuiz(milestoneId, true);
-    }, 500);
-  }
-
-  async function createPlan() {
-    var doc = currentDoc();
-    if (!doc) { notify("请先上传课件。"); return; }
-    var button = $("createPlanBtn");
-    if (button) button.disabled = true;
-    try {
-      var plan = await api("/api/plan", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          doc_id: doc.doc_id,
-          total_days: Number($("planDays").value || 5),
-          daily_minutes: Number($("planMinutes").value || 60),
-          difficulty: Number($("planDifficulty").value || 3),
-          api: apiConfig()
-        })
-      });
-      state.activePlanId = plan.plan_id;
-      state.plan = plan;
-      await loadPlans();
-      if (plan.source === "fallback") {
-        notify("模型未返回有效计划，已生成回退计划。" + (plan.warnings && plan.warnings[0] ? " " + plan.warnings[0] : ""));
-      } else {
-        notify("学习计划已生成。");
-      }
-    } catch (error) {
-      notify(error.message);
-    } finally {
-      if (button) button.disabled = false;
-    }
-  }
-
-  function quizMilestoneKey() {
-    var doc = currentDoc();
-    return doc && state.plan ? doc.doc_id + "|" + state.plan.plan_id : "";
-  }
-
-  function renderMilestones() {
-    var select = $("quizMilestoneSelect");
-    if (!select) return;
-    if (!state.plan) {
-      select.innerHTML = '<option value="">先创建学习计划</option>';
-      return;
-    }
-    var savedMilestone = "";
-    try {
-      savedMilestone = localStorage.getItem("ln_agent_quiz_milestone_v1:" + quizMilestoneKey()) || "";
     } catch (ignored) { /* ignore */ }
-    var previous = select.value || savedMilestone;
-    select.innerHTML = state.plan.milestones.map(function (milestone) {
-      return '<option value="' + escapeHtml(milestone.milestone_id) + '">' +
-        escapeHtml(milestone.title) + "</option>";
-    }).join("");
-    var exists = Array.prototype.some.call(select.options, function (option) {
-      return option.value === previous;
-    });
-    if (exists) {
-      select.value = previous;
-    } else {
-      select.selectedIndex = state.plan.milestones.length - 1;
-    }
+    return state.signature || "zh|3";
   }
 
-  async function loadQuizState() {
+  function applySections(data) {
+    state.sections = (data && data.sections) || [];
+    state.summary = (data && data.summary) || null;
+    state.signature = (data && data.signature) || signature();
+  }
+
+  async function loadSections(retry) {
     var doc = currentDoc();
-    var plan = state.plan;
-    var select = $("quizMilestoneSelect");
-    if (!doc || !plan || !select || !select.value) return;
-    var requestedDocId = doc.doc_id;
-    var requestedPlanId = plan.plan_id;
-    var milestoneId = select.value;
-    try {
-      var data = await api("/api/quiz/history?doc_id=" + encodeURIComponent(requestedDocId) +
-        "&plan_id=" + encodeURIComponent(requestedPlanId) +
-        "&milestone_id=" + encodeURIComponent(milestoneId));
-      if (!state.doc || state.doc.doc_id !== requestedDocId ||
-          !state.plan || state.plan.plan_id !== requestedPlanId ||
-          !select || select.value !== milestoneId) {
-        return;
-      }
-      state.quiz = data.quiz || null;
-      state.quizAnswers = {};
-      if (state.quiz) {
-        renderQuiz();
-        if (data.result) renderQuizResult(data.result);
-        $("quizStatus").textContent = data.result
-          ? "已恢复上次测试，得分 " + Math.round(Number(data.result.score || 0) * 100) + "%"
-          : "已恢复上次生成的测试";
-      } else {
-        $("quizQuestions").innerHTML = '<div class="learning-empty">该里程碑还没有测试，点击“生成测试”开始。</div>';
-        $("submitQuizBtn").disabled = true;
-        $("retryQuizBtn").hidden = true;
-        $("quizResult").textContent = "";
-        $("quizStatus").textContent = "等待生成测试";
-      }
-    } catch (error) {
-      $("quizStatus").textContent = error.message;
+    if (!doc) {
+      renderSectionOptions();
+      return;
     }
+    var requestedDocId = doc.doc_id;
+    var sig = signature();
+    var failure = "";
+    try {
+      var data = await api(
+        "/api/sections?doc_id=" + encodeURIComponent(requestedDocId) +
+        "&signature=" + encodeURIComponent(sig)
+      );
+      if (!currentDoc() || currentDoc().doc_id !== requestedDocId) return;
+      applySections(data);
+    } catch (error) {
+      failure = error && error.message ? error.message : "章节读取失败";
+      state.sections = [];
+      state.summary = null;
+    }
+    if (!retry && !(state.sections || []).length &&
+        window.NotesApp && window.NotesApp.refreshSections) {
+      // Notes may have been restored from cache before the checklist sync ran.
+      try { await window.NotesApp.refreshSections(); } catch (ignored) { /* ignore */ }
+      return loadSections(true);
+    }
+    state.sectionsError = failure;
+    renderSectionOptions();
+  }
+
+  function completedSections() {
+    return (state.sections || []).filter(function (item) { return item.completed; });
+  }
+
+  function quizLanguage() {
+    var select = $("quizLanguage");
+    var saved = "";
+    try { saved = localStorage.getItem("ln_agent_quiz_language_v1") || ""; } catch (ignored) { /* ignore */ }
+    if (select) {
+      if (!select.dataset.ready) {
+        var notesLang = String(signature().split("|")[0] || "zh");
+        select.value = saved || (notesLang === "en" ? "en" : "zh");
+        select.dataset.ready = "1";
+      }
+      return select.value === "en" ? "en" : "zh";
+    }
+    return saved === "en" ? "en" : "zh";
+  }
+
+  function syncQuizCount(selectedCount) {
+    var input = $("quizCount");
+    if (!input) return;
+    if (!input.dataset.touched) input.value = String(Math.min(10, Math.max(1, selectedCount * 2)));
+  }
+
+  function renderSectionChips(done, pending) {
+    var box = $("quizSectionChips");
+    if (!box) return;
+    var waiting = pending || [];
+    if (!done.length && !waiting.length) {
+      box.hidden = true;
+      box.innerHTML = "";
+      return;
+    }
+    var active = state.selectedSection || "__all__";
+    var chips = [];
+    if (done.length) {
+      chips.push('<button type="button" class="section-chip' +
+        (active === "__all__" ? " active" : "") + '" data-section-chip="__all__">' +
+        "全部已勾选<span>" + done.length + " 章</span></button>");
+    }
+    done.forEach(function (item) {
+      var pages = item.pages || [];
+      var suffix = pages.length > 1
+        ? "p." + pages[0] + "-" + pages[pages.length - 1]
+        : "p." + pages[0];
+      chips.push(
+        '<button type="button" class="section-chip' +
+        (active === item.section_id ? " active" : "") +
+        '" data-section-chip="' + escapeHtml(item.section_id) + '">' +
+        escapeHtml(item.title) + "<span>" + suffix + "</span></button>"
+      );
+    });
+    waiting.forEach(function (item) {
+      chips.push(
+        '<button type="button" class="section-chip pending" data-goto-notes="1"' +
+        ' title="到笔记里勾选该章节">' + escapeHtml(item.title) +
+        "<span>去勾选</span></button>"
+      );
+    });
+    box.innerHTML = chips.join("");
+    box.hidden = false;
+    Array.prototype.forEach.call(box.querySelectorAll("[data-section-chip]"), function (chip) {
+      chip.addEventListener("click", function () {
+        state.selectedSection = chip.getAttribute("data-section-chip");
+        renderSectionOptions();
+      });
+    });
+    Array.prototype.forEach.call(box.querySelectorAll("[data-goto-notes]"), function (chip) {
+      chip.addEventListener("click", function () {
+        switchWorkspace("notes");
+      });
+    });
+  }
+
+  function renderSectionOptions() {
+    var select = $("quizSectionSelect");
+    var button = $("generateQuizBtn");
+    var done = completedSections();
+    if (!select) return;
+    var previous = state.selectedSection || select.value || "__all__";
+    if (!done.length) {
+      select.innerHTML = '<option value="">先在笔记中勾选章节</option>';
+      select.disabled = true;
+      if (button) button.disabled = true;
+      renderSectionChips([], state.sections || []);
+      var error = state.sectionsError ||
+        (window.NotesApp && window.NotesApp.getSectionError ? window.NotesApp.getSectionError() : "");
+      $("quizStatus").textContent = error
+        ? error
+        : (state.sections.length
+          ? "已注册 " + state.sections.length + " 个章节，勾选后即可出题"
+          : "先生成笔记，再勾选章节");
+      return;
+    }
+    select.disabled = false;
+    var options = ['<option value="__all__">全部已勾选章节（' + done.length + "）</option>"];
+    done.forEach(function (item) {
+      var pages = item.pages || [];
+      var suffix = pages.length > 1 ? "p." + pages[0] + "-" + pages[pages.length - 1] : "p." + pages[0];
+      options.push(
+        '<option value="' + escapeHtml(item.section_id) + '">' +
+        escapeHtml(item.title) + " · " + suffix + "</option>"
+      );
+    });
+    select.innerHTML = options.join("");
+    var keep = previous !== "__all__" && done.some(function (item) {
+      return item.section_id === previous;
+    });
+    select.value = keep ? previous : "__all__";
+    state.selectedSection = select.value;
+    if (button) button.disabled = false;
+    var total = (state.summary && state.summary.total) || (state.sections || []).length;
+    if (!state.quiz) {
+      $("quizStatus").textContent = "已完成 " + done.length + "/" + total + " 章，可开始测试";
+    }
+    syncQuizCount(select.value === "__all__" ? done.length : 1);
+    renderSectionChips(done, (state.sections || []).filter(function (item) {
+      return !item.completed;
+    }));
+  }
+
+  function quizSectionIds() {
+    var select = $("quizSectionSelect");
+    var done = completedSections();
+    var value = select ? select.value : "__all__";
+    if (!value || value === "__all__") {
+      return done.map(function (item) { return item.section_id; });
+    }
+    return [value];
+  }
+
+  function renderQuizEmptyState(message) {
+    var box = $("quizQuestions");
+    if (box) box.innerHTML = '<div class="learning-empty">' + escapeHtml(message) + "</div>";
+    if ($("submitQuizBtn")) $("submitQuizBtn").disabled = true;
+    if ($("retryQuizBtn")) $("retryQuizBtn").hidden = true;
+    if ($("quizResult")) $("quizResult").textContent = "";
+  }
+
+  function restoreQuiz(quiz, result) {
+    state.quiz = quiz || null;
+    state.quizAnswers = {};
+    if (!state.quiz || !(state.quiz.questions || []).length) {
+      renderQuizEmptyState("还没有测试，选择章节后点击“生成测试”。");
+      $("quizStatus").textContent = "等待生成测试";
+      return;
+    }
+    renderQuiz();
+    if (result) renderQuizResult(result);
+    $("quizStatus").textContent = result
+      ? "已恢复上次测试，得分 " + Math.round(Number(result.score || 0) * 100) + "%"
+      : "已恢复上次生成的测试";
   }
 
   function renderQuizResult(result) {
@@ -391,19 +326,20 @@
 
   async function loadQuizHistory() {
     var doc = currentDoc();
-    var plan = state.plan;
-    if (!doc || !plan) return;
+    if (!doc) return;
     var requestedDocId = doc.doc_id;
-    var requestedPlanId = plan.plan_id;
+    var sig = signature();
     try {
-      var data = await api("/api/quiz/history?doc_id=" + encodeURIComponent(requestedDocId) +
-        "&plan_id=" + encodeURIComponent(requestedPlanId));
-      if (!state.doc || state.doc.doc_id !== requestedDocId ||
-          !state.plan || state.plan.plan_id !== requestedPlanId) {
-        return;
-      }
+      var data = await api(
+        "/api/quiz/history?doc_id=" + encodeURIComponent(requestedDocId) +
+        "&signature=" + encodeURIComponent(sig)
+      );
+      if (!currentDoc() || currentDoc().doc_id !== requestedDocId) return;
       state.quizRecords = data.records || [];
       renderQuizHistory();
+      if (!state.quiz && data.quiz) {
+        restoreQuiz(data.quiz, data.result);
+      }
     } catch (error) {
       var box = $("quizHistory");
       if (box) box.innerHTML = '<div class="quiz-history-empty">' + escapeHtml(error.message) + "</div>";
@@ -424,7 +360,8 @@
           ? record.result.correct_count + "/" + record.result.total_count +
             " · " + Math.round(Number(record.result.score || 0) * 100) + "%"
           : "未提交";
-        var source = record.source === "fallback" ? "回退题" : "模型题";
+        var source = record.source === "fallback" ? "原文比对题" : "模型题";
+        var language = record.language === "en" ? "EN" : "中文";
         var date = String(record.created_at || "").replace("T", " ").slice(0, 16);
         var quiz = record.quiz || {};
         var questions = quiz.questions || [];
@@ -456,8 +393,9 @@
         detail += '<button type="button" class="btn ghost small" data-open-record="' +
           escapeHtml(record.quiz_id) + '">在测试面板打开</button></div>';
         return '<details class="quiz-history-item"><summary class="quiz-history-row">' +
-          '<span>' + escapeHtml(record.milestone_title || record.milestone_id) + '</span>' +
-          '<small>' + escapeHtml(source) + " · " + escapeHtml(score) + " · " + escapeHtml(date) +
+          '<span>' + escapeHtml((record.section_titles || []).join("、") || "章节测试") + '</span>' +
+          '<small>' + escapeHtml(language) + " · " + escapeHtml(source) + " · " +
+          escapeHtml(score) + " · " + escapeHtml(date) +
           '</small></summary>' + detail + '</details>';
       }).join("");
     Array.prototype.forEach.call(box.querySelectorAll("[data-open-record]"), function (button) {
@@ -469,23 +407,24 @@
 
   async function openQuizRecord(quizId) {
     var doc = currentDoc();
-    var plan = state.plan;
-    if (!doc || !plan || !quizId) return;
+    if (!doc || !quizId) return;
     var requestedDocId = doc.doc_id;
-    var requestedPlanId = plan.plan_id;
     try {
       var quiz = await api("/api/quiz/" + encodeURIComponent(quizId));
-      if (!state.doc || state.doc.doc_id !== requestedDocId ||
-          !state.plan || state.plan.plan_id !== requestedPlanId) return;
+      if (!currentDoc() || currentDoc().doc_id !== requestedDocId) return;
       var record = (state.quizRecords || []).filter(function (item) {
         return item.quiz_id === quizId;
       })[0];
-      var select = $("quizMilestoneSelect");
-      if (select && record && record.milestone_id) {
+      var select = $("quizSectionSelect");
+      if (select && record && (record.section_ids || []).length === 1) {
+        var targetId = record.section_ids[0];
         var exists = Array.prototype.some.call(select.options, function (option) {
-          return option.value === record.milestone_id;
+          return option.value === targetId;
         });
-        if (exists) select.value = record.milestone_id;
+        if (exists) {
+          select.value = targetId;
+          state.selectedSection = targetId;
+        }
       }
       state.quiz = quiz;
       state.quizAnswers = {};
@@ -499,26 +438,20 @@
     }
   }
 
-  async function generateQuiz(milestoneId, auto, force) {
+  async function generateQuiz(force) {
     var doc = currentDoc();
-    if (!doc || !state.plan) { notify("请先创建学习计划。"); return; }
-    var select = $("quizMilestoneSelect");
-    if (milestoneId && select) {
-      var exists = Array.prototype.some.call(select.options, function (option) {
-        return option.value === milestoneId;
-      });
-      if (exists) select.value = milestoneId;
-    }
-    var milestone = milestoneId || (select ? select.value : "");
-    if (!milestone) { notify("请选择里程碑。"); return; }
+    if (!doc) { notify("请先上传课件。"); return; }
+    var ids = quizSectionIds();
+    if (!ids.length) { notify("请先在笔记中勾选章节。"); return; }
     var requestedDocId = doc.doc_id;
-    var requestedPlanId = state.plan.plan_id;
+    var requestedSignature = signature();
+    var language = quizLanguage();
     var button = $("generateQuizBtn");
     if (state.quizController) state.quizController.abort();
     var controller = new AbortController();
     state.quizController = controller;
     if (button) button.disabled = true;
-    $("quizStatus").textContent = auto ? "已自动生成测试…" : "生成中…";
+    $("quizStatus").textContent = "生成中…";
     try {
       var data = await api("/api/quiz", {
         method: "POST",
@@ -526,35 +459,35 @@
         signal: controller.signal,
         body: JSON.stringify({
           doc_id: requestedDocId,
-          plan_id: requestedPlanId,
-          milestone_id: milestone,
-          question_count: Number($("quizCount").value || 5),
+          signature: requestedSignature,
+          section_ids: ids,
+          question_count: Math.min(10, Math.max(1, Number($("quizCount").value || 5))),
           difficulty: $("quizDifficulty").value,
+          language: language,
           force: Boolean(force),
           api: apiConfig()
         })
       });
       if (controller.signal.aborted) return;
-      if (!state.doc || state.doc.doc_id !== requestedDocId ||
-          !state.plan || state.plan.plan_id !== requestedPlanId ||
-          (select && select.options.length > 0 && select.value !== milestone)) {
-        return;
-      }
+      if (!currentDoc() || currentDoc().doc_id !== requestedDocId) return;
+      if (quizSectionIds().join("|") !== ids.join("|")) return;
       state.quiz = data.quiz;
       state.quizAnswers = {};
       renderQuiz();
-      if (state.quiz.source === "fallback") {
-        $("quizStatus").textContent = "测试使用回退题（模型未返回有效题目）";
-        notify("模型未返回有效题目，已使用回退题。" + (state.quiz.warnings && state.quiz.warnings[0] ? " " + state.quiz.warnings[0] : ""));
+      if (!state.quiz || !(state.quiz.questions || []).length) {
+        $("quizStatus").textContent = "内容不足，未能生成题目";
+        notify("所选章节内容不足，未能生成题目。");
+      } else if (state.quiz.source === "fallback") {
+        $("quizStatus").textContent = "使用课件原文比对题（模型未返回有效题目）";
+        notify("模型未返回有效题目，已改用课件原文比对题。");
       } else {
-        $("quizStatus").textContent = data.cached ? "已复用缓存测试" : (auto ? "测试已自动生成" : "测试已生成");
-        if (auto) notify("完成里程碑，已自动生成测试。");
+        $("quizStatus").textContent = data.cached ? "已复用缓存测试" : "测试已生成";
       }
       loadQuizHistory();
     } catch (error) {
       if (error.name !== "AbortError") {
         $("quizStatus").textContent = error.message;
-        if (auto) notify("自动生成测试失败：" + error.message);
+        notify(error.message);
       }
     } finally {
       if (state.quizController === controller) {
@@ -580,8 +513,11 @@
         return '<label class="quiz-option"><input type="radio" name="q-' + index + '" value="' +
           escapeHtml(option.charAt(0)) + '"> ' + escapeHtml(option) + "</label>";
       }).join("");
+      var type = question.question_type === "apply"
+        ? '<span class="quiz-type apply">应用题</span>'
+        : '<span class="quiz-type">辨析题</span>';
       return '<div class="quiz-question"><h4>' + (index + 1) + ". " + escapeHtml(question.question_text) +
-        '</h4>' + options + '<div class="quiz-hint" data-hint="' + index + '">显示提示</div>' +
+        type + '</h4>' + options + '<div class="quiz-hint" data-hint="' + index + '">显示提示</div>' +
         '<div class="quiz-hint-text" id="hint-' + index + '" hidden>' + escapeHtml(question.hint || "") +
         '</div></div>';
     }).join("");
@@ -758,23 +694,73 @@
     }
   }
 
+  async function onQuizRequest(event) {
+    var detail = event.detail || {};
+    var doc = currentDoc();
+    if (!doc || !detail.section_id) {
+      notify("章节还没准备好，请稍后再试。");
+      return;
+    }
+    switchWorkspace("quiz", { skipLoad: true });
+    $("quizStatus").textContent = "正在准备该章节的测试…";
+    await loadSections();
+    loadQuizHistory();
+    var item = (state.sections || []).filter(function (entry) {
+      return entry.section_id === detail.section_id;
+    })[0];
+    if (!item) {
+      var reason = state.sectionsError ||
+        (window.NotesApp && window.NotesApp.getSectionError ? window.NotesApp.getSectionError() : "");
+      $("quizStatus").textContent = reason || "该章节尚未注册，请重新生成笔记";
+      notify(reason || "该章节尚未注册，请重新生成笔记后再试。");
+      return;
+    }
+    if (!item.completed && window.NotesApp && window.NotesApp.setSectionCompleted) {
+      state.selectedSection = detail.section_id;
+      await window.NotesApp.setSectionCompleted(detail.section_id, true);
+      await loadSections();
+      var refreshed = (state.sections || []).filter(function (entry) {
+        return entry.section_id === detail.section_id;
+      })[0];
+      if (!refreshed || !refreshed.completed) {
+        $("quizStatus").textContent = "勾选该章节失败，请手动勾选后重试";
+        notify("勾选该章节失败，请手动勾选后重试。");
+        return;
+      }
+    }
+    state.selectedSection = detail.section_id;
+    renderSectionOptions();
+    generateQuiz(false);
+  }
+
   function onDocChanged(event) {
     if (state.quizController) state.quizController.abort();
     state.quizController = null;
     if (state.chatController) state.chatController.abort();
     state.chatController = null;
     state.doc = event.detail && event.detail.doc;
-    state.plans = [];
-    state.plan = null;
-    state.progress = null;
+    state.sections = [];
+    state.summary = null;
+    state.signature = "";
+    state.sectionsError = "";
     state.quiz = null;
     state.quizRecords = [];
     state.quizAnswers = {};
+    state.selectedSection = "";
     var historyBox = $("quizHistory");
     if (historyBox) historyBox.innerHTML = "";
-    if (state.workspace === "plan") loadPlans();
     if (state.workspace === "quiz") loadQuizWorkspace();
     if (state.workspace === "chat") loadChat();
+  }
+
+  function onSectionsChanged(event) {
+    var detail = event.detail || {};
+    if (!currentDoc() || !detail.sections) return;
+    state.sections = detail.sections;
+    state.summary = detail.summary || state.summary;
+    state.signature = detail.signature || signature();
+    state.sectionsError = "";
+    renderSectionOptions();
   }
 
   function bind() {
@@ -785,24 +771,27 @@
         if (button) switchWorkspace(button.dataset.workspace);
       });
     }
-    if ($("createPlanBtn")) $("createPlanBtn").addEventListener("click", createPlan);
     if ($("generateQuizBtn")) $("generateQuizBtn").addEventListener("click", function () {
-      // After the first quiz is visible, the primary button means "generate a new one".
-      generateQuiz(null, false, Boolean(state.quiz));
+      generateQuiz(Boolean(state.quiz));
     });
     if ($("submitQuizBtn")) $("submitQuizBtn").addEventListener("click", submitQuiz);
-    if ($("retryQuizBtn")) $("retryQuizBtn").addEventListener("click", function () { generateQuiz(null, false, true); });
-    if ($("quizMilestoneSelect")) {
-      $("quizMilestoneSelect").addEventListener("change", function () {
-        if (state.quizController) {
-          state.quizController.abort();
-          state.quizController = null;
-        }
+    if ($("retryQuizBtn")) $("retryQuizBtn").addEventListener("click", function () { generateQuiz(true); });
+    if ($("quizSectionSelect")) {
+      $("quizSectionSelect").addEventListener("change", function () {
+        state.selectedSection = $("quizSectionSelect").value;
+        syncQuizCount(state.selectedSection === "__all__" ? completedSections().length : 1);
+      });
+    }
+    if ($("quizCount")) {
+      $("quizCount").addEventListener("input", function () {
+        $("quizCount").dataset.touched = "1";
+      });
+    }
+    if ($("quizLanguage")) {
+      $("quizLanguage").addEventListener("change", function () {
         try {
-          var key = quizMilestoneKey();
-          if (key) localStorage.setItem("ln_agent_quiz_milestone_v1:" + key, $("quizMilestoneSelect").value);
+          localStorage.setItem("ln_agent_quiz_language_v1", quizLanguage());
         } catch (ignored) { /* ignore */ }
-        if (state.workspace === "quiz") loadQuizState();
       });
     }
     if ($("sendChatBtn")) $("sendChatBtn").addEventListener("click", sendChat);
@@ -816,6 +805,8 @@
       });
     }
     document.addEventListener("notes:doc-changed", onDocChanged);
+    document.addEventListener("notes:sections-changed", onSectionsChanged);
+    document.addEventListener("notes:quiz-request", onQuizRequest);
   }
 
   function init() {
@@ -823,9 +814,10 @@
     state.doc = window.NotesApp && window.NotesApp.getDoc ? window.NotesApp.getDoc() : null;
     var saved = null;
     try { saved = localStorage.getItem("ln_agent_workspace_v1"); } catch (ignored) { /* ignore */ }
+    if (saved === "plan") saved = "notes";
     switchWorkspace(saved || "notes");
+    loadSections();
     registerFeature("stage3.chat", function () { /* chat handlers bound above */ });
-    registerFeature("stage4.plan", function () { /* plan handlers bound above */ });
     registerFeature("stage5.quiz", function () { /* quiz handlers bound above */ });
   }
 
